@@ -2,229 +2,141 @@ import os
 import cv2
 import torch
 import numpy as np
+import pandas as pd
 from torch.utils.data import DataLoader, Dataset
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-import matplotlib.pyplot as plt
-import seaborn as sns
-import time
 from models.enhanced_cnn import Enhanced3DCNN
 from models.siamese_network import SiameseNetwork
-from models.feature_extraction import LBPModule, GLCMModule
+from tqdm import tqdm
 
 class TestVideoDataset(Dataset):
     def __init__(self, root_dir):
         self.files = []
-        self.labels = []
-        
         for label in ['real', 'fake']:
             path = os.path.join(root_dir, label)
-            if not os.path.exists(path):
-                continue
-                
             for file in os.listdir(path):
                 if file.endswith('.mp4'):
-                    self.files.append(os.path.join(path, file))
-                    self.labels.append(1 if label == 'fake' else 0)
+                    self.files.append((os.path.join(path, file), label))
         
-        print(f"Found {len(self.files)} videos for testing")
+        self.label_map = {'real': 0, 'fake': 1}
 
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
-        path = self.files[idx]
-        label = self.labels[idx]
-        
-        frames = self.extract_frames(path)
-        frames = torch.tensor(frames, dtype=torch.float32) / 255.0
-        
-        return frames, torch.tensor(label, dtype=torch.float32)
-    
-    def extract_frames(self, video_path, num_frames=4):
-        cap = cv2.VideoCapture(video_path)
+        path, label = self.files[idx]
+        cap = cv2.VideoCapture(path)
         frames = []
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        if frame_count <= num_frames:
-            indices = list(range(frame_count))
-        else:
-            indices = [int(i * frame_count / num_frames) for i in range(num_frames)]
-
-        for i in range(frame_count):
+        while len(frames) < 4:  # Get at least 4 frames
             ret, frame = cap.read()
             if not ret:
                 break
-            if i in indices:
-                frame = cv2.resize(frame, (128, 128))
-                if frame.shape[2] > 3:
-                    frame = frame[:, :, :3]
-                frame = frame.transpose(2, 0, 1)  # (C, H, W)
-                frames.append(frame)
-
+            frame = cv2.resize(frame, (128, 128))
+            frames.append(frame.transpose(2, 0, 1))  # (C, H, W)
+        
         cap.release()
-
-        # Ensure we have exactly `num_frames`
-        while len(frames) < num_frames:
-            frames.append(frames[-1] if frames else np.zeros((3, 128, 128), dtype=np.uint8))
-
-        return np.stack(frames)
-
-def find_latest_model(models_dir='saved_models'):
-    """Find the most recent model file in the models directory"""
-    if not os.path.exists(models_dir):
-        print(f"Error: Models directory '{models_dir}' not found.")
-        return None
         
-    model_files = [f for f in os.listdir(models_dir) if f.endswith('.pth')]
-    
-    if not model_files:
-        print(f"No model files found in {models_dir}")
-        return None
+        # Pad if we couldn't get 4 frames
+        while len(frames) < 4:
+            frames.append(np.zeros_like(frames[0]))
         
-    # Sort by modification time (newest first)
-    model_files.sort(key=lambda x: os.path.getmtime(os.path.join(models_dir, x)), reverse=True)
-    
-    return os.path.join(models_dir, model_files[0])
+        frames = np.stack(frames)
+        frames = torch.tensor(frames, dtype=torch.float32) / 255.0
+        
+        return frames, torch.tensor(self.label_map[label], dtype=torch.float32), path
 
-def create_model(device):
-    """Create a model with the same architecture as used in training"""
-    enhanced_cnn = Enhanced3DCNN(input_channels=3, feature_dim=128).to(device)
-    
-    # Set model to evaluation mode
-    enhanced_cnn.eval()
-    
-    # Initialize the Siamese network
-    model = SiameseNetwork(enhanced_cnn, feature_dim=128).to(device)
-    model.eval()
-    
-    return model
-
-def main():
-    # Set test data directory
-    test_dir = "test_data"
-    if not os.path.exists(test_dir):
-        print(f"Test data directory '{test_dir}' not found.")
-        return
-    
-    # Find the most recent model
-    model_path = find_latest_model()
-    if model_path is None:
-        return
-    
-    print(f"Using model: {model_path}")
-    
-    # Set device
+def test_model(model_path='saved_models/saved_model.pth'):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
     
-    # Create model with the same architecture
-    model = create_model(device)
+    # Initialize the model
+    enhanced_cnn = Enhanced3DCNN(input_channels=3, feature_dim=128).to(device)
+    model = SiameseNetwork(enhanced_cnn, feature_dim=128).to(device)
     
-    # Load state dict
+    # Load the trained model weights
     try:
-        state_dict = torch.load(model_path, map_location=device)
-        # Load state dict with strict=False to handle any mismatches
-        incompatible_keys = model.load_state_dict(state_dict, strict=False)
-        print("Model loaded with non-strict option")
-        print(f"Missing keys: {len(incompatible_keys.missing_keys)}")
-        print(f"Unexpected keys: {len(incompatible_keys.unexpected_keys)}")
-        print("Model loaded successfully")
+        model.load_state_dict(torch.load(model_path, map_location=device),strict=False)
+        print(f"Successfully loaded model from {model_path}")
     except Exception as e:
         print(f"Error loading model: {e}")
         return
     
+    # Set model to evaluation mode
     model.eval()
     
-    # Create dataset and dataloader
-    test_dataset = TestVideoDataset(root_dir=test_dir)
+    # Load test data
+    test_dataset = TestVideoDataset(root_dir='test_data')
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
     
-    # Initialize lists to store results
-    all_preds = []
-    all_labels = []
+    results = []
+    correct = 0
+    total = 0
     
-    # Evaluate model
-    print("Evaluating model...")
-    
+    print("Starting evaluation...")
     with torch.no_grad():
-        for frames, labels in test_loader:
-            try:
-                # Ensure frames have the right shape
-                # Input shape should be [batch_size, channels, frames, height, width]
-                # But current shape is [batch_size, frames, channels, height, width]
-                # So we need to permute the dimensions
-                frames = frames.permute(0, 2, 1, 3, 4)
-                
-                # Ensure we have exactly 3 channels (RGB)
-                if frames.shape[1] > 3:
-                    frames = frames[:, :3, :, :, :]
-                
-                # Move to device
-                face_input = frames.to(device)
-                background_input = frames.to(device)  # Use same input for both branches
-                
-                # Forward pass
-                outputs = model(face_input, background_input).squeeze()
-                
-                # Convert to predictions
-                preds = (outputs > 0.5).float().cpu().numpy()
-                
-                # Handle scalar case
-                if np.isscalar(preds):
-                    all_preds.append(preds)
-                    all_labels.append(labels.cpu().numpy()[0])
-                else:
-                    all_preds.extend(preds)
-                    all_labels.extend(labels.cpu().numpy())
-                
-                # Print progress
-                print(f"Processed {len(all_preds)}/{len(test_dataset)} videos", end="\r")
-                
-            except Exception as e:
-                print(f"Error during processing: {e}")
-                print(f"Input shape: {frames.shape}")
-                # Continue to next batch
-                continue
+        for frames, labels, file_paths in tqdm(test_loader, desc="Testing"):
+            face_input = frames.to(device)
+            background_input = frames.to(device)  # Use same frames as background (placeholder)
+            labels = labels.to(device)
+            
+            # Keep only the first 3 channels (if the input is RGBA)
+            face_input = face_input[:, :3, :, :, :]
+            background_input = background_input[:, :3, :, :, :]
+            
+            # Forward pass
+            outputs = model(face_input, background_input)
+            predicted = (outputs.squeeze() > 0.5).float()
+            
+            # Update accuracy
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            
+            # Store results
+            if predicted.dim() == 0:  # It's a scalar
+                pred_value = predicted.item()
+            else:  # It's a tensor with dimensions
+                pred_value = predicted[i].item()
+
+            for i in range(len(file_paths)):
+                results.append({
+                    'file_path': file_paths[i],
+                    'actual_label': 'real' if labels[i].item() == 0 else 'fake',
+                    'predicted_label': 'real' if pred_value == 0 else 'fake',
+                    'confidence': outputs[i].item(),
+                    'correct': pred_value == labels[i].item()
+                })
     
-    # Check if we have predictions
-    if len(all_preds) == 0:
-        print("No valid predictions were made. Please check the model architecture.")
-        return
+    # Calculate accuracy
+    accuracy = 100 * correct / total
+    print(f"Test Accuracy: {accuracy:.2f}%")
     
-    # Calculate metrics
-    accuracy = accuracy_score(all_labels, all_preds)
-    precision = precision_score(all_labels, all_preds, zero_division=0)
-    recall = recall_score(all_labels, all_preds, zero_division=0)
-    f1 = f1_score(all_labels, all_preds, zero_division=0)
+    # Create DataFrame with results
+    df = pd.DataFrame(results)
+    print("\nTesting Results DataFrame:")
+    print(df)
     
-    # Print results
-    print("\nEvaluation Results:")
-    print(f"Accuracy: {accuracy:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall: {recall:.4f}")
-    print(f"F1 Score: {f1:.4f}")
+    # Save results to CSV
+    csv_path = 'test_results.csv'
+    df.to_csv(csv_path, index=False)
+    print(f"Results saved to {csv_path}")
     
-    # Confusion matrix
-    cm = confusion_matrix(all_labels, all_preds)
+    # Calculate metrics per class
+    real_accuracy = df[df['actual_label'] == 'real']['correct'].mean() * 100
+    fake_accuracy = df[df['actual_label'] == 'fake']['correct'].mean() * 100
     
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                xticklabels=['Real', 'Fake'], 
-                yticklabels=['Real', 'Fake'])
-    plt.xlabel('Predicted Label')
-    plt.ylabel('True Label')
-    plt.title('Confusion Matrix')
-    plt.tight_layout()
+    print(f"\nReal videos detection accuracy: {real_accuracy:.2f}%")
+    print(f"Fake videos detection accuracy: {fake_accuracy:.2f}%")
     
-    # Create results directory if it doesn't exist
-    results_dir = 'results'
-    os.makedirs(results_dir, exist_ok=True)
-    
-    # Save confusion matrix
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    cm_path = os.path.join(results_dir, f'confusion_matrix_{timestamp}.png')
-    plt.savefig(cm_path)
-    print(f"Confusion matrix saved as {cm_path}")
+    return df
 
 if __name__ == "__main__":
-    main()
+    # Specify the path to your trained model
+    model_path = 'saved_models/saved_model20250318_222138.pth'  # Update this path as needed
+    # If you have multiple models to test, you can list them here
+    # model_paths = ['saved_models/saved_model20250318_120000.pth', 'saved_models/saved_model20250319_083000.pth']
+    # for path in model_paths:
+    #     print(f"\nTesting model: {path}")
+    #     test_model(path)
+    
+    # Test the default model
+    test_model(model_path)

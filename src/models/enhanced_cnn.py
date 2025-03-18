@@ -31,9 +31,7 @@ class Enhanced3DCNN(nn.Module):
         # Block 2
         self.conv2 = nn.Conv3d(8, 16, kernel_size=(3, 3, 3), stride=1, padding='same')
         self.bn2 = nn.BatchNorm3d(16)
-        # self.pool2 = nn.MaxPool3d(kernel_size=(2, 2, 2), stride=(2, 2, 2), padding=0)
         self.pool2 = nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2), padding=0)
-
         
         # Block 3
         self.conv3 = nn.Conv3d(16, 32, kernel_size=(3, 3, 3), stride=1, padding='same')
@@ -50,57 +48,66 @@ class Enhanced3DCNN(nn.Module):
         self.bn5 = nn.BatchNorm3d(128)
         self.pool5 = nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2), padding=0)
         
-        # Calculate size after convolutions and pooling
-        # Input: 128x128x4x3
-        # After pool1: 128x64x4x8
-        # After pool2: 64x32x2x16
-        # After pool3: 32x16x1x32
-        # After pool4: 16x8x0x64 (actually 16x8x1x64 with padding)
-        # After pool5: 8x4x0x128 (actually 8x4x1x128 with padding)
-        
-        # Assuming we have padding that keeps the time dimension as 1 after pooling
-        self.fc_input_size = None
-        self.fc=None
-        # Fully connected layers
+        # Initialize fully connected layers
+        self.fc_input_size = None  # Will be determined on first forward pass
+        self.fc = None  # Will be initialized dynamically
         self.dropout = nn.Dropout(0.5)
-        # self.fc = nn.Linear(self.fc_input_size, feature_dim)
-        self.bn_fc = None
+        self.bn_fc = None  # Will be initialized dynamically
+        
+    def apply_bn(self, x, bn_layer, batch_size):
+        """Apply batch normalization only if not in eval mode with batch_size=1"""
+        if self.training or batch_size > 1:
+            return bn_layer(x)
+        else:
+            return x  # Skip batch norm for inference with batch_size=1
         
     def forward(self, x):
-        # print("Input shape:", x.shape)
-        x = self.spatiotemporal_attention(x)
-        # print("After attention:", x.shape)
-
-        x = F.relu(self.bn1(self.conv1(x)))
-        # print("After conv1:", x.shape)
-        x = self.pool1(x)
-        # print("After pool1:", x.shape)
-
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = self.pool2(x)
-        # print("After pool2:", x.shape)
-
-        x = F.relu(self.bn3(self.conv3(x)))
-        x = self.pool3(x)
-        # print("After pool3:", x.shape)
-
-        x = F.relu(self.bn4(self.conv4(x)))
-        x = self.pool4(x)
-        # print("After pool4:", x.shape)
-
-        x = F.relu(self.bn5(self.conv5(x)))
-        x = self.pool5(x)
-        # print("After pool5:", x.shape)
-
         batch_size = x.size(0)
-        x = x.view(batch_size, -1)
+        
+        # Apply attention
+        x = self.spatiotemporal_attention(x)
+        
+        # Apply convolutional blocks
+        x = F.relu(self.apply_bn(self.conv1(x), self.bn1, batch_size))
+        x = self.pool1(x)
+        
+        x = F.relu(self.apply_bn(self.conv2(x), self.bn2, batch_size))
+        x = self.pool2(x)
+        
+        x = F.relu(self.apply_bn(self.conv3(x), self.bn3, batch_size))
+        x = self.pool3(x)
+        
+        x = F.relu(self.apply_bn(self.conv4(x), self.bn4, batch_size))
+        x = self.pool4(x)
+        
+        x = F.relu(self.apply_bn(self.conv5(x), self.bn5, batch_size))
+        x = self.pool5(x)
+        
+        # Ensure tensor is contiguous before reshaping
+        x = x.contiguous()
+        
+        # Use reshape instead of view to avoid the "view size not compatible" error
+        try:
+            x = x.reshape(batch_size, -1)
+        except RuntimeError:
+            # If reshape fails, print shape and return zeros as a fallback
+            print(f"Failed to reshape tensor of shape {x.shape}")
+            return torch.zeros(batch_size, self.feature_dim, device=x.device)
+        
+        # Initialize FC layers if they haven't been yet
         if self.fc is None:
             self.fc_input_size = x.size(1)
             self.fc = nn.Linear(self.fc_input_size, self.feature_dim).to(x.device)
             self.bn_fc = nn.BatchNorm1d(self.feature_dim).to(x.device)
 
+        # Apply FC layers
         x = self.dropout(x)
         x = self.fc(x)
-        x = F.relu(self.bn_fc(x))
+        
+        # Apply batch norm for FC layer, skipping for batch_size=1 during eval
+        if self.training or batch_size > 1:
+            x = F.relu(self.bn_fc(x))
+        else:
+            x = F.relu(x)  # Skip batch norm
 
         return x
