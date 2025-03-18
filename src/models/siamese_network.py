@@ -48,11 +48,14 @@ class SiameseNetwork(nn.Module):
             if self.fc_combined is None:
                 feature_size = combined.size(1)
                 self.fc_combined = nn.Linear(feature_size, 1).to(combined.device)
-            
+                with torch.no_grad():
+                    self.fc_combined.weight.data *= 0.1
+
+            logits = self.fc_combined(combined)
             # Get final output
-            output = torch.sigmoid(self.fc_combined(combined))
+            output = torch.sigmoid(logits/1.5)
             
-            return output
+            return output.view(-1,1)
             
         except Exception as e:
             print(f"Error in SiameseNetwork forward pass: {e}")
