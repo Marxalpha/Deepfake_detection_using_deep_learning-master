@@ -3,27 +3,30 @@ import cv2
 import torch
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 import matplotlib.pyplot as plt
 import seaborn as sns
+import time
 from models.enhanced_cnn import Enhanced3DCNN
 from models.siamese_network import SiameseNetwork
+from models.feature_extraction import LBPModule, GLCMModule
 
 class TestVideoDataset(Dataset):
-    def __init__(self, root_dir=None):
+    def __init__(self, root_dir):
         self.files = []
         self.labels = []
         
-        if root_dir is not None:
-            for label in ['real', 'fake']:
-                path = os.path.join(root_dir, label)
-                if not os.path.exists(path):
-                    continue
-                    
-                for file in os.listdir(path):
-                    if file.endswith('.mp4'):
-                        self.files.append(os.path.join(path, file))
-                        self.labels.append(1 if label == 'fake' else 0)
+        for label in ['real', 'fake']:
+            path = os.path.join(root_dir, label)
+            if not os.path.exists(path):
+                continue
+                
+            for file in os.listdir(path):
+                if file.endswith('.mp4'):
+                    self.files.append(os.path.join(path, file))
+                    self.labels.append(1 if label == 'fake' else 0)
+        
+        print(f"Found {len(self.files)} videos for testing")
 
     def __len__(self):
         return len(self.files)
@@ -33,11 +36,9 @@ class TestVideoDataset(Dataset):
         label = self.labels[idx]
         
         frames = self.extract_frames(path)
-
-        # Convert to tensor and normalize
         frames = torch.tensor(frames, dtype=torch.float32) / 255.0
         
-        return frames, torch.tensor(label, dtype=torch.float32), path
+        return frames, torch.tensor(label, dtype=torch.float32)
     
     def extract_frames(self, video_path, num_frames=4):
         cap = cv2.VideoCapture(video_path)
@@ -55,7 +56,6 @@ class TestVideoDataset(Dataset):
                 break
             if i in indices:
                 frame = cv2.resize(frame, (128, 128))
-                # Ensure frame has 3 channels (RGB)
                 if frame.shape[2] > 3:
                     frame = frame[:, :, :3]
                 frame = frame.transpose(2, 0, 1)  # (C, H, W)
@@ -69,205 +69,144 @@ class TestVideoDataset(Dataset):
 
         return np.stack(frames)
 
-def debug_model_input_shapes(model, device, batch_size=1):
-    """Helper function to print shapes at various stages of the model"""
-    # Generate random input of same shape as our data
-    dummy_input = torch.rand(batch_size, 3, 4, 128, 128).to(device)
-    print(f"Generated dummy input with shape: {dummy_input.shape}")
+def find_latest_model(models_dir='saved_models'):
+    """Find the most recent model file in the models directory"""
+    if not os.path.exists(models_dir):
+        print(f"Error: Models directory '{models_dir}' not found.")
+        return None
+        
+    model_files = [f for f in os.listdir(models_dir) if f.endswith('.pth')]
     
-    # Hook to capture intermediate tensor shapes
-    activation = {}
-    def get_activation(name):
-        def hook(model, input, output):
-            activation[name] = output.detach()
-        return hook
+    if not model_files:
+        print(f"No model files found in {models_dir}")
+        return None
+        
+    # Sort by modification time (newest first)
+    model_files.sort(key=lambda x: os.path.getmtime(os.path.join(models_dir, x)), reverse=True)
     
-    # Register hooks for the model's modules
-    hooks = []
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Linear) or isinstance(module, torch.nn.Conv3d):
-            hooks.append(module.register_forward_hook(get_activation(name)))
+    return os.path.join(models_dir, model_files[0])
+
+def create_model(device):
+    """Create a model with the same architecture as used in training"""
+    enhanced_cnn = Enhanced3DCNN(input_channels=3, feature_dim=128).to(device)
     
-    # Forward pass
-    try:
-        with torch.no_grad():
-            model(dummy_input, dummy_input)
-            
-        # Print shapes
-        print("\nIntermediate tensor shapes:")
-        for name, act in activation.items():
-            if isinstance(act, tuple):
-                print(f"{name}: {[t.shape for t in act]}")
-            else:
-                print(f"{name}: {act.shape}")
-    except Exception as e:
-        print(f"Error in forward pass: {e}")
-    finally:
-        for hook in hooks:
-            hook.remove()
-
-def predict_single_video(model, video_path, device):
-    """
-    Function to predict on a single video file
-    """
-    dataset = TestVideoDataset(root_dir=None)
-    frames = dataset.extract_frames(video_path)
-    print(f"Extracted frames shape: {frames.shape}")
-
-    # Normalize and create batch dimension
-    frames = torch.tensor(frames, dtype=torch.float32).unsqueeze(0) / 255.0
-    print(f"Input tensor shape after unsqueeze: {frames.shape}")
-
-    # Ensure 3 channels and rearrange to match model's expected format
-    if frames.shape[2] > 3:
-        frames = frames[:, :, :3, :, :]
+    # Set model to evaluation mode
+    enhanced_cnn.eval()
     
-    # Rearrange dimensions to match model input shape
-    frames = frames.permute(0, 2, 1, 3, 4)  # [1, 3, 4, 128, 128]
-    print(f"Input tensor shape after permute: {frames.shape}")
-
+    # Initialize the Siamese network
+    model = SiameseNetwork(enhanced_cnn, feature_dim=128).to(device)
     model.eval()
-    with torch.no_grad():
-        face_input = frames.to(device)
-        background_input = frames.to(device)
-        outputs = model(face_input, background_input)
+    
+    return model
 
-    probability = outputs.item()
-    prediction = 1 if probability > 0.5 else 0
-
-    return prediction, probability
-
-def evaluate_model(model_path, test_dir, batch_size=8):
+def main():
+    # Set test data directory
+    test_dir = "test_data"
+    if not os.path.exists(test_dir):
+        print(f"Test data directory '{test_dir}' not found.")
+        return
+    
+    # Find the most recent model
+    model_path = find_latest_model()
+    if model_path is None:
+        return
+    
+    print(f"Using model: {model_path}")
+    
+    # Set device
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
-
-    # Initialize model
-    enhanced_cnn = Enhanced3DCNN(input_channels=3, feature_dim=128).to(device)
-    model = SiameseNetwork(enhanced_cnn, feature_dim=128).to(device)
-
-    # Load trained model weights
-    print(f"Loading model from {model_path}")
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    
+    # Create model with the same architecture
+    model = create_model(device)
+    
+    # Load state dict
+    try:
+        state_dict = torch.load(model_path, map_location=device)
+        # Load state dict with strict=False to handle any mismatches
+        incompatible_keys = model.load_state_dict(state_dict, strict=False)
+        print("Model loaded with non-strict option")
+        print(f"Missing keys: {len(incompatible_keys.missing_keys)}")
+        print(f"Unexpected keys: {len(incompatible_keys.unexpected_keys)}")
+        print("Model loaded successfully")
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        return
+    
     model.eval()
     
-    # Debug model with dummy input
-    print("\nDebugging model with dummy input...")
-    debug_model_input_shapes(model, device)
-
-    # Create test dataset and dataloader
+    # Create dataset and dataloader
     test_dataset = TestVideoDataset(root_dir=test_dir)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-    print(f"\nTesting on {len(test_dataset)} videos from {test_dir}")
-
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+    
+    # Initialize lists to store results
     all_preds = []
     all_labels = []
-    all_probs = []
-    all_filenames = []
-
-    # Try with smaller batch size if regular fails
-    current_batch_size = batch_size
     
-    try:
-        with torch.no_grad():
-            # Process first batch
-            batch_data = next(iter(test_loader))
-            frames, labels, filenames = batch_data
-            
-            print(f"First batch frame tensor shape: {frames.shape}")
-            
-            # Ensure consistent channel count
-            frames = frames[:, :, :3, :, :]  # Keep only 3 channels
-            print(f"After channel adjustment: {frames.shape}")
-
-            # Rearrange dimensions before feeding into the model
-            frames = frames.permute(0, 2, 1, 3, 4)  # [batch_size, 3, num_frames, 128, 128]
-            print(f"After permute: {frames.shape}")
-
-            face_input = frames.to(device)
-            background_input = frames.to(device)
-
-            # This might raise the matrix multiplication error
-            outputs = model(face_input, background_input).squeeze()
-            
-            # If we get here, we can proceed with the full evaluation
-            print("First batch processed successfully, continuing with evaluation...")
-            
-            preds = (outputs > 0.5).float().cpu().numpy()
-            all_preds.extend(preds)
-            all_labels.extend(labels.cpu().numpy())
-            all_probs.extend(outputs.cpu().numpy())
-            all_filenames.extend(filenames)
-            
-            # Continue with rest of batches
-            for frames, labels, filenames in itertools.islice(test_loader, 1, None):
-                frames = frames[:, :, :3, :, :]
+    # Evaluate model
+    print("Evaluating model...")
+    
+    with torch.no_grad():
+        for frames, labels in test_loader:
+            try:
+                # Ensure frames have the right shape
+                # Input shape should be [batch_size, channels, frames, height, width]
+                # But current shape is [batch_size, frames, channels, height, width]
+                # So we need to permute the dimensions
                 frames = frames.permute(0, 2, 1, 3, 4)
                 
+                # Ensure we have exactly 3 channels (RGB)
+                if frames.shape[1] > 3:
+                    frames = frames[:, :3, :, :, :]
+                
+                # Move to device
                 face_input = frames.to(device)
-                background_input = frames.to(device)
+                background_input = frames.to(device)  # Use same input for both branches
+                
+                # Forward pass
                 outputs = model(face_input, background_input).squeeze()
                 
+                # Convert to predictions
                 preds = (outputs > 0.5).float().cpu().numpy()
-                all_preds.extend(preds)
-                all_labels.extend(labels.cpu().numpy())
-                all_probs.extend(outputs.cpu().numpy())
-                all_filenames.extend(filenames)
-    
-    except RuntimeError as e:
-        print(f"Error with batch size {current_batch_size}: {e}")
-        print("\nAttempting with batch size 1...")
-        
-        # Fallback to batch size 1
-        test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
-        
-        all_preds = []
-        all_labels = []
-        all_probs = []
-        all_filenames = []
-        
-        try:
-            with torch.no_grad():
-                for frames, labels, filenames in test_loader:
-                    frames = frames[:, :, :3, :, :]
-                    frames = frames.permute(0, 2, 1, 3, 4)
-                    
-                    face_input = frames.to(device)
-                    background_input = frames.to(device)
-                    outputs = model(face_input, background_input).squeeze()
-                    
-                    preds = (outputs > 0.5).float().cpu().numpy()
+                
+                # Handle scalar case
+                if np.isscalar(preds):
+                    all_preds.append(preds)
+                    all_labels.append(labels.cpu().numpy()[0])
+                else:
                     all_preds.extend(preds)
                     all_labels.extend(labels.cpu().numpy())
-                    all_probs.extend(outputs.cpu().numpy())
-                    all_filenames.extend(filenames)
-        except Exception as e:
-            print(f"Error with batch size 1: {e}")
-            print("Please check model architecture and training parameters.")
-            return None
-
+                
+                # Print progress
+                print(f"Processed {len(all_preds)}/{len(test_dataset)} videos", end="\r")
+                
+            except Exception as e:
+                print(f"Error during processing: {e}")
+                print(f"Input shape: {frames.shape}")
+                # Continue to next batch
+                continue
+    
+    # Check if we have predictions
+    if len(all_preds) == 0:
+        print("No valid predictions were made. Please check the model architecture.")
+        return
+    
     # Calculate metrics
     accuracy = accuracy_score(all_labels, all_preds)
     precision = precision_score(all_labels, all_preds, zero_division=0)
     recall = recall_score(all_labels, all_preds, zero_division=0)
     f1 = f1_score(all_labels, all_preds, zero_division=0)
-
-    try:
-        auc = roc_auc_score(all_labels, all_probs)
-    except:
-        auc = 0.0
-
+    
     # Print results
-    print(f"\nEvaluation Results:")
+    print("\nEvaluation Results:")
     print(f"Accuracy: {accuracy:.4f}")
     print(f"Precision: {precision:.4f}")
     print(f"Recall: {recall:.4f}")
     print(f"F1 Score: {f1:.4f}")
-    print(f"AUC-ROC: {auc:.4f}")
-
+    
     # Confusion matrix
     cm = confusion_matrix(all_labels, all_preds)
-
+    
     plt.figure(figsize=(8, 6))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
                 xticklabels=['Real', 'Fake'], 
@@ -276,26 +215,16 @@ def evaluate_model(model_path, test_dir, batch_size=8):
     plt.ylabel('True Label')
     plt.title('Confusion Matrix')
     plt.tight_layout()
-    plt.savefig('confusion_matrix.png')
-    print(f"Confusion matrix saved as confusion_matrix.png")
-
-    return {
-        'accuracy': accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
-        'auc': auc,
-        'predictions': list(zip(all_filenames, all_labels, all_preds, all_probs))
-    }
+    
+    # Create results directory if it doesn't exist
+    results_dir = 'results'
+    os.makedirs(results_dir, exist_ok=True)
+    
+    # Save confusion matrix
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    cm_path = os.path.join(results_dir, f'confusion_matrix_{timestamp}.png')
+    plt.savefig(cm_path)
+    print(f"Confusion matrix saved as {cm_path}")
 
 if __name__ == "__main__":
-    import argparse
-    import itertools
-
-    parser = argparse.ArgumentParser(description="Test deepfake detection model")
-    parser.add_argument('--model', type=str, required=True, help='Path to the trained model')
-    parser.add_argument('--data', type=str, required=True, help='Path to the test data directory')
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size for evaluation')
-
-    args = parser.parse_args()
-    evaluate_model(args.model, args.data, args.batch_size)
+    main()

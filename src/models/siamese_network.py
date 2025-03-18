@@ -12,7 +12,7 @@ class SiameseNetwork(nn.Module):
         self.lbp = LBPModule(enhanced_3d_cnn)
         
         # Combined feature vector size
-        self.fc_combined = nn.Linear(402, 1)
+        self.fc_combined = None
 
     def forward(self, face_input, background_input):
         # Deep learning features
@@ -25,5 +25,8 @@ class SiameseNetwork(nn.Module):
         
         # Combine all features
         combined = torch.cat([face_features, background_features, glcm_feat, lbp_feat], dim=1)
+        if self.fc_combined is None:
+            feature_size = combined.size(1)
+            self.fc_combined = nn.Linear(feature_size, 1).to(combined.device)
         output = torch.sigmoid(self.fc_combined(combined))
         return output

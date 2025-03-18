@@ -103,7 +103,8 @@ def train():
         print(f"Epoch [{epoch+1}/{num_epochs}] completed => Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%")
     
     # Save the trained model
-    model_save_path = os.path.join('saved_models', f'saved_model{datetime.now()}.pth')
+    time=datetime.now().strftime('%Y%m%d_%H%M%S')
+    model_save_path = os.path.join('saved_models', f'saved_model{time}.pth')
     os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
     torch.save(model.state_dict(), model_save_path)
     print(f"Model saved to {model_save_path}")

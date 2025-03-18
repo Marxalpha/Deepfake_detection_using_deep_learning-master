@@ -19,7 +19,8 @@ class Enhanced3DCNN(nn.Module):
             feature_dim (int): Dimension of the output feature vector
         """
         super(Enhanced3DCNN, self).__init__()
-        
+        self.feature_dim = feature_dim
+
         self.spatiotemporal_attention = SpatiotemporalAttention(in_channels=input_channels)
         
         # Block 1
@@ -58,12 +59,12 @@ class Enhanced3DCNN(nn.Module):
         # After pool5: 8x4x0x128 (actually 8x4x1x128 with padding)
         
         # Assuming we have padding that keeps the time dimension as 1 after pooling
-        self.fc_input_size = 6144
-        
+        self.fc_input_size = None
+        self.fc=None
         # Fully connected layers
         self.dropout = nn.Dropout(0.5)
-        self.fc = nn.Linear(self.fc_input_size, feature_dim)
-        self.bn_fc = nn.BatchNorm1d(feature_dim)
+        # self.fc = nn.Linear(self.fc_input_size, feature_dim)
+        self.bn_fc = None
         
     def forward(self, x):
         # print("Input shape:", x.shape)
@@ -91,8 +92,12 @@ class Enhanced3DCNN(nn.Module):
         x = self.pool5(x)
         # print("After pool5:", x.shape)
 
-        x = x.view(x.size(0), -1)
-        # print("After flatten:", x.shape)
+        batch_size = x.size(0)
+        x = x.view(batch_size, -1)
+        if self.fc is None:
+            self.fc_input_size = x.size(1)
+            self.fc = nn.Linear(self.fc_input_size, self.feature_dim).to(x.device)
+            self.bn_fc = nn.BatchNorm1d(self.feature_dim).to(x.device)
 
         x = self.dropout(x)
         x = self.fc(x)
